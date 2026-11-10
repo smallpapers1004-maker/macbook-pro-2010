@@ -1,0 +1,14 @@
+[Unit]
+Description=On-demand Docker container status for the voice assistant
+
+[Socket]
+ListenStream=/run/macbook-assistant-docker.sock
+SocketUser=root
+SocketGroup=macbook-assistant
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,30 @@
+# Merge into /etc/asound.conf. Replace both hw addresses using aplay -l / arecord -l.
+pcm.spdif_mix {
+    type dmix
+    ipc_key 201016
+    ipc_key_add_uid false
+    # MPD and the assistant normally run as different Unix users.
+    ipc_perm 0666
+    slave {
+        pcm "hw:0,1"
+        format S16_LE
+        rate 48000
+        channels 2
+    }
+}
+pcm.spdif_shared {
+    type plug
+    slave.pcm "spdif_mix"
+    hint {
+        show on
+        description "Shared S/PDIF PCM"
+    }
+}
+pcm.assistant_mic {
+    type plug
+    slave.pcm "hw:0,0"
+    hint {
+        show on
+        description "Assistant microphone (ALSA plug)"
+    }
+}

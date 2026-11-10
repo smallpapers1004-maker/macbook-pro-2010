@@ -1,0 +1,17 @@
+[Unit]
+Description=List Docker container names and states for the voice assistant
+After=docker.service
+
+[Service]
+Type=exec
+Environment=DOCKER_HOST=unix:///run/docker.sock
+ExecStart=/bin/sh -ec '/usr/bin/docker ps --format "{{.Names}} ({{.Status}})" && echo DOCKER_PS_OK'
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=5s
+TimeoutStopSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX

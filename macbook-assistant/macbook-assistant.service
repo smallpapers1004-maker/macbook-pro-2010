@@ -1,0 +1,31 @@
+[Unit]
+Description=Korean voice assistant for MacBook
+Wants=network-online.target
+After=network-online.target sound.target mpd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=macbook-assistant
+Group=macbook-assistant
+SupplementaryGroups=audio
+WorkingDirectory=/opt/macbook-assistant
+EnvironmentFile=/opt/macbook-assistant/.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+ExecStart=/opt/macbook-assistant/.venv/bin/python /opt/macbook-assistant/assistant.py
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78
+TimeoutStopSec=25
+KillMode=mixed
+StateDirectory=macbook-assistant
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

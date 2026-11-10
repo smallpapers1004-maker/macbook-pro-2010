@@ -1,0 +1,15 @@
+[Unit]
+Description=Idle suspend guard for MacBook Pro on DietPi
+After=network.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/etc/default/auto-sleep-guard
+ExecStart=/usr/bin/python3 /usr/local/sbin/auto_sleep_guard.py
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

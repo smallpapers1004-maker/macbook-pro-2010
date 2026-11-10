@@ -1,0 +1,14 @@
+# openwakeword==0.6.0 is installed separately in the README with --no-deps.
+# Its Linux metadata requires TFLite, which the ONNX-only runtime never imports.
+google-genai>=2,<3
+onnxruntime>=1.20.1,<2
+numpy>=1.26.4,<2.4
+scipy>=1.11,<2
+scikit-learn>=1.3,<2
+requests>=2.32,<3
+tqdm>=4.66,<5
+sounddevice>=0.5,<1
+edge-tts>=7.2,<8
+python-mpd2>=3.1,<4
+httpx[socks]>=0.28,<1
+python-dotenv>=1,<2

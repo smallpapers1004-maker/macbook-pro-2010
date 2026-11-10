@@ -1,0 +1,5 @@
+#!/bin/sh
+# systemd-sleep이 복귀하면 서비스의 대기를 즉시 깨운다.
+if [ "$1" = post ]; then
+    /usr/bin/systemctl --kill-who=main --signal=SIGUSR1 kill auto-sleep-guard.service >/dev/null 2>&1 || :
+fi
