@@ -12,3 +12,5 @@ edge-tts>=7.2,<8
 python-mpd2>=3.1,<4
 httpx[socks]>=0.28,<1
 python-dotenv>=1,<2
+yt-dlp[default]>=2026.3.17
+ytmusicapi>=1.11,<2

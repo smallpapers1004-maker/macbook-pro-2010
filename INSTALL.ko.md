@@ -8,7 +8,7 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install python3-venv openssl sudo mpd mpc ethtool
+sudo apt-get install python3-venv openssl sudo mpd mpc ethtool mpv alsa-utils
 getent passwd macbook-assistant >/dev/null ||
   sudo useradd --system --user-group --shell /usr/sbin/nologin macbook-assistant
 sudo install -d -m 0755 /opt/macbook-web /opt/macbook-assistant
@@ -16,7 +16,7 @@ sudo install -m 0755 web_remote.py /opt/macbook-web/web_remote.py
 sudo python3 -m venv /opt/macbook-web/.venv
 sudo /opt/macbook-web/.venv/bin/python -m pip install \
   'fastapi>=0.110,<1' 'pydantic>=2,<3' 'uvicorn>=0.27,<1' \
-  'python-mpd2>=3.1,<4' 'psutil>=5.9,<8'
+  'python-mpd2>=3.1,<4' 'psutil>=5.9,<8' 'ytmusicapi>=1.10,<2' 'yt-dlp[default]'
 sudo install -d -o macbook-assistant -g macbook-assistant -m 0700 /var/lib/macbook-assistant
 sudo test -e /opt/macbook-assistant/memo.json ||
   sudo test -L /opt/macbook-assistant/memo.json ||
@@ -128,6 +128,7 @@ After=network.target mpd.service
 Type=simple
 User=macbook-assistant
 Group=macbook-assistant
+SupplementaryGroups=audio
 WorkingDirectory=/opt/macbook-web
 EnvironmentFile=/etc/macbook-web/web.env
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
@@ -138,6 +139,7 @@ StateDirectory=macbook-assistant
 StateDirectoryMode=0700
 UMask=0077
 ProtectSystem=full
+PrivateTmp=true
 NoNewPrivileges=no
 
 [Install]
@@ -153,7 +155,7 @@ sudo journalctl -u macbook-web.service -n 40 --no-pager
 
 ## 5. CasaOS 대시보드 등록
 
-기존 웹 리모컨을 업데이트하려면 내려받은 `web_remote.py`가 있는 폴더에서 다음 명령을 실행하세요. 서비스의 환경 파일에 저장된 기존 리모컨 키를 그대로 사용합니다.
+기존 웹 리모컨을 YouTube Music 지원 버전으로 업데이트하는 경우 먼저 [YouTube Music과 RCA 연결](#7-youtube-music과-rca-연결)의 의존성 및 서비스 설정을 적용하세요. 그런 다음 내려받은 `web_remote.py`가 있는 폴더에서 아래 명령으로 교체합니다. 서비스 환경 파일의 기존 리모컨 키를 사용합니다.
 
 ```bash
 sudo install -m 0755 web_remote.py /opt/macbook-web/web_remote.py
@@ -198,3 +200,70 @@ CasaOS Files에서 `/DATA/Media/Music`에 음원을 올린 뒤 리모컨의 **MP
 5. 유선 이더넷에서 `ip -br link`로 인터페이스 이름을 찾고, 예시의 `enp2s0`을 바꿔 `sudo ethtool enp2s0`을 실행합니다. `Supports Wake-on:`에 `g`가 있으면 `sudo ethtool -s enp2s0 wol g`로 매직 패킷을 활성화하고 `Wake-on: g`인지 확인합니다. 절전 버튼을 누른 뒤 같은 LAN의 WOL 앱에서 유선 MAC 주소로 매직 패킷을 보내 검증하세요. 먼저 전원 버튼으로도 깨어나는지 확인해 두면 WOL 테스트에 실패했을 때 복귀할 수 있습니다. 재부팅 뒤 WOL 설정이 유지되는지는 DietPi의 네트워크 설정에 따라 다릅니다. [ethtool 매뉴얼](https://man7.org/linux/man-pages/man8/ethtool.8.html)
 
 절전 버튼은 systemd에 절전을 요청합니다. WOL 성공 여부와 1~2W 소비전력 달성 여부는 해당 맥북과 유선 랜의 절전 상태에 달려 있습니다. 실제 소비전력은 어댑터 쪽 전력계에서 확인하세요. [systemctl 매뉴얼](https://www.freedesktop.org/software/systemd/man/latest/systemctl.html)
+
+## 7. YouTube Music과 RCA 연결
+
+### 기존 웹 리모컨 업데이트
+
+이미 설치한 경우 아래 의존성을 추가하고 서비스 오버라이드를 등록하세요. 신규 설치의 기본 서비스에는 이 설정이 포함돼 있습니다.
+
+```bash
+sudo apt-get install mpv alsa-utils
+sudo /opt/macbook-web/.venv/bin/python -m pip install 'ytmusicapi>=1.10,<2' 'yt-dlp[default]'
+sudo install -d -m 0755 /etc/systemd/system/macbook-web.service.d
+sudo tee /etc/systemd/system/macbook-web.service.d/youtube-audio.conf >/dev/null <<'EOF'
+[Service]
+SupplementaryGroups=audio
+PrivateTmp=true
+EOF
+sudo systemctl daemon-reload
+```
+
+최신 yt-dlp의 YouTube 처리는 EJS와 지원되는 JavaScript 런타임을 사용합니다. 음성 비서와 마찬가지로 웹은 기본적으로 `deno`를 사용합니다. 이미 쓰는 런타임이 서비스 PATH에 없으면 `/etc/macbook-web/web.env`에 `YTDLP_JS_RUNTIME=deno:/usr/local/bin/deno`처럼 실제 경로를 지정하세요. 지원되는 Node.js를 설치한 경우 `YTDLP_JS_RUNTIME=node`로 바꿀 수 있습니다. [yt-dlp 런타임과 EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS)
+
+### 보관함 인증 경로와 웹 설정
+
+웹과 음성 비서는 `/opt/macbook-assistant/browser.json`을 함께 읽습니다. 웹에서 검증 후 저장할 수 있도록 서비스 계정의 상태 디렉터리를 가리키는 링크로 준비합니다. 아래 명령은 기존 일반 파일을 보존해 옮깁니다. 상태 디렉터리에도 별도의 인증 파일이 이미 있으면 두 파일 중 사용할 것을 확인할 수 있도록 중단합니다.
+
+```bash
+sudo sh -eu <<'EOF'
+path=/opt/macbook-assistant/browser.json
+target=/var/lib/macbook-assistant/browser.json
+if [ -L "$path" ]; then
+    readlink -f "$path"
+else
+    if [ -e "$path" ]; then
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            echo '인증 파일이 두 경로에 있습니다. 사용할 파일을 확인해 주세요.' >&2
+            exit 1
+        fi
+        install -m 0600 -o macbook-assistant -g macbook-assistant "$path" "$target"
+    fi
+    ln -sfnT "$target" "$path"
+fi
+EOF
+```
+
+기존 링크를 사용하는 경우 링크의 실제 대상 디렉터리가 `macbook-assistant` 계정에 쓰기 가능해야 합니다. **계정 연동** 창은 맥북에서 직접 `http://127.0.0.1:8080/`을 열거나 HTTPS로 접속했을 때 헤더를 받습니다. 맥북에 브라우저가 없다면 데스크톱에서 아래 SSH 터널을 열고 해당 데스크톱의 `http://127.0.0.1:18080/`에 접속하세요.
+
+```bash
+ssh -N -L 127.0.0.1:18080:127.0.0.1:8080 사용자명@맥북-LAN-IP
+```
+
+HTTPS 리버스 프록시를 쓴다면 같은 맥북의 루프백 주소로 연결하고 프록시가 클라이언트의 전달 헤더를 교체하도록 설정하세요. 웹 환경 파일에 `WEB_TRUST_LOCAL_PROXY=1`을 넣으면 루프백 프록시의 전달 헤더를 사용합니다.
+
+YouTube Music에 로그인한 브라우저에서 개발자 도구 → **Network**를 열고 `browse` 요청의 **Request Headers**를 복사합니다. 리모컨의 **계정 연동(Request Headers 붙여넣기)** 창에서 **검증 후 저장**을 누르세요. 보관함이 열리는지 확인한 뒤 파일을 권한 `0600`으로 교체합니다. 헤더와 `browser.json`에는 로그인 세션 정보가 있으므로 웹 리모컨 설정 창에서만 입력하세요. [ytmusicapi 브라우저 인증](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html)
+
+공개 검색과 YouTube 주소 재생은 계정 연동 없이 사용할 수 있습니다. 계정은 보관함 조회에 사용하며, mpv는 각 트랙의 URL을 스트리밍합니다. 로그인이나 지역 조건이 필요한 곡은 보관함에 있어도 재생이 제한될 수 있습니다. 웹과 음성 비서의 mpv 대기열은 각각의 서비스에서 제어합니다. [mpv JSON IPC](https://mpv.io/manual/stable/#json-ipc)
+
+### RCA 출력과 볼륨
+
+`aplay -l`로 아날로그 재생 장치를, `amixer scontrols`로 믹서를 확인하세요. 음성 비서 설치에서 `analog_shared` ALSA 장치를 준비했다면 `/etc/macbook-web/web.env`에 아래와 같이 지정할 수 있습니다. 웹 YouTube의 기본 출력은 ALSA `default`입니다.
+
+```ini
+ALSA_PCM=analog_shared
+# 믹서가 기본 카드에 없을 때 실제 카드로 변경합니다.
+# ALSA_CONTROL_DEVICE=hw:0
+```
+
+환경 파일을 수정한 뒤 웹 서비스를 재시작하세요. **3.5mm 아날로그(RCA) 볼륨**은 `Master`와 `Headphone` 각각에 같은 비율과 `unmute`를 적용합니다. **스피커 최적 볼륨 (85%)**은 85% 프리셋입니다. 연결한 앰프나 스피커의 볼륨과 함께 조절하세요. 한쪽 믹서만 있으면 화면에 적용된 믹서를 표시합니다. MPD의 재생 카드에 있는 볼륨은 기존 MPD 제어입니다. [amixer 매뉴얼](https://manpages.debian.org/trixie/alsa-utils/amixer.1.en.html)

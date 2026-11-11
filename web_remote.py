@@ -8,9 +8,12 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import secrets
 import select
+import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -22,7 +25,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event, Lock, Thread
 from typing import Literal
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import urlopen
 
 import psutil
@@ -32,6 +35,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from mpd import CommandError, MPDClient, MPDError
 from pydantic import BaseModel, Field
+from requests import Session
+import ytmusicapi
+from ytmusicapi.exceptions import YTMusicError
 
 LOG = logging.getLogger("uvicorn.error")
 MPD_HOST = os.getenv("MPD_HOST", "localhost")
@@ -52,6 +58,22 @@ BAR_COUNT = 32
 QUEUE_LIMIT = 8
 REMOTE_HOST = "0.0.0.0"
 REMOTE_PORT = 8080
+YT_AUTH = Path("/opt/macbook-assistant/browser.json")
+YT_SOCKET = Path("/tmp/mpv-yt.sock")
+YT_QUEUE = Path("/tmp/ytmusic_queue.m3u")
+ALSA_PCM = os.getenv("ALSA_PCM", "default")
+ALSA_CONTROL_DEVICE = os.getenv("ALSA_CONTROL_DEVICE", "")
+YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME", "deno")
+TRUST_LOCAL_PROXY = os.getenv("WEB_TRUST_LOCAL_PROXY") == "1"
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+PLAYLIST_ID = re.compile(r"[A-Za-z0-9_-]{1,150}")
+YT_CONTROLS = {
+    "pause": ("cycle", "pause"),
+    "next": ("playlist-next", "weak"),
+    "prev": ("playlist-prev", "weak"),
+}
+MIXERS = ("Master", "Headphone")
+analog_lock = Lock()
 
 
 class MusicAction(BaseModel):
@@ -65,6 +87,23 @@ class MemoInput(BaseModel):
 
 class MemoRemoval(BaseModel):
     revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class YTPlaylist(BaseModel):
+    playlistId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,150}$")
+    shuffle: bool = False
+
+
+class YouTubeQuery(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+
+
+class YouTubeControl(BaseModel):
+    action: Literal["pause", "next", "prev", "stop"]
+
+
+class AnalogVolume(BaseModel):
+    volume: int = Field(ge=0, le=100, strict=True)
 
 
 def require_key(request: Request):
@@ -352,6 +391,243 @@ class PCMReader:
         return bars if time.monotonic() - updated < 0.8 else []
 
 
+class LibrarySession(Session):
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", (3, 7))
+        return super().request(*args, **kwargs)
+
+
+@contextmanager
+def youtube_library(path):
+    if not path.is_file():
+        raise HTTPException(409, "먼저 YouTube Music 계정을 연동해 주세요.")
+    try:
+        with LibrarySession() as session:
+            yield ytmusicapi.YTMusic(str(path), language="ko", requests_session=session)
+    except Exception as exc:
+        # The library may attach request headers to errors.
+        LOG.warning("YouTube Music library request failed (%s)", type(exc).__name__)
+        raise HTTPException(502, "YouTube Music 보관함에 연결하지 못했습니다. 네트워크와 인증 헤더를 확인해 주세요.") from None
+
+
+def save_youtube_auth(raw):
+    target = YT_AUTH.resolve()
+    temp_path = None
+    try:
+        with NamedTemporaryFile(dir=target.parent, prefix=".ytmusic-auth-", delete=False) as temp:
+            temp_path = Path(temp.name)
+        try:
+            ytmusicapi.setup(filepath=str(temp_path), headers_raw=raw)
+        except (YTMusicError, ValueError, KeyError, TypeError):
+            raise HTTPException(422, "YouTube Music browse 요청의 Request Headers 전체를 다시 복사해 주세요.") from None
+        with youtube_library(temp_path) as library:
+            library.get_library_playlists(limit=1)
+        os.replace(temp_path, target)
+    except OSError:
+        raise HTTPException(503, "인증 파일 쓰기 권한이 없습니다. 설치 가이드의 browser.json 경로를 확인해 주세요.") from None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def thumbnail_url(playlist):
+    for item in reversed(playlist.get("thumbnails") or []):
+        value = item.get("url", "")
+        try:
+            url = urlsplit(value)
+        except (TypeError, ValueError):
+            continue
+        if url.scheme == "https" and (url.hostname or "").endswith((".googleusercontent.com", ".ytimg.com")):
+            return value
+    return None
+
+
+def youtube_source(query):
+    query = " ".join(query.split())
+    if not query or "\x00" in query:
+        raise HTTPException(422, "검색어나 YouTube 주소를 입력해 주세요.")
+    if re.match(r"^(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com|m\.youtube\.com)/", query, re.I):
+        query = "https://" + query
+    if "://" not in query:
+        return "ytdl://ytsearch1:" + query
+    try:
+        url = urlsplit(query)
+    except ValueError:
+        raise HTTPException(422, "유효한 YouTube 주소를 입력해 주세요.") from None
+    params = parse_qs(url.query)
+    parts = url.path.strip("/").split("/")
+    video_id = ""
+    if url.hostname == "youtu.be" and len(parts) == 1:
+        video_id = parts[0]
+    elif url.hostname in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
+        if parts == ["watch"]:
+            video_id = params.get("v", [""])[0]
+        elif len(parts) == 2 and parts[0] in {"shorts", "live", "embed"}:
+            video_id = parts[1]
+        elif parts == ["playlist"] and PLAYLIST_ID.fullmatch(params.get("list", [""])[0]):
+            if url.scheme in {"http", "https"} and url.username is None:
+                return "https://www.youtube.com/playlist?list=" + params["list"][0]
+    if url.scheme in {"http", "https"} and url.username is None and VIDEO_ID.fullmatch(video_id):
+        return "https://www.youtube.com/watch?v=" + video_id
+    raise HTTPException(422, "YouTube 동영상·재생목록 주소나 검색어를 입력해 주세요.")
+
+
+class WebYouTubePlayer:
+    def __init__(self):
+        self.lock = Lock()
+        self.process = None
+        self.queue_owned = False
+
+    def ipc(self, *commands):
+        deadline = time.monotonic() + 0.6
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(0.6)
+            conn.connect(str(YT_SOCKET))
+            payload = b"".join(json.dumps({"command": command, "request_id": index}).encode() + b"\n"
+                               for index, command in enumerate(commands, 1))
+            conn.sendall(payload)
+            if commands == (("quit",),):
+                return []
+            with conn.makefile("rb") as reply:
+                responses = {}
+                while len(responses) < len(commands) and time.monotonic() < deadline:
+                    conn.settimeout(max(0.01, deadline - time.monotonic()))
+                    line = reply.readline(65536)
+                    if not line:
+                        break
+                    message = json.loads(line)
+                    index = message.get("request_id")
+                    if isinstance(index, int) and 1 <= index <= len(commands):
+                        responses[index] = message
+        if len(responses) != len(commands):
+            raise TimeoutError("Incomplete mpv IPC reply")
+        return [responses[index] for index in range(1, len(commands) + 1)]
+
+    def cleanup(self):
+        if self.process is not None:
+            YT_SOCKET.unlink(missing_ok=True)
+            self.process = None
+        if self.queue_owned:
+            YT_QUEUE.unlink(missing_ok=True)
+            self.queue_owned = False
+
+    def stop(self):
+        if self.process is not None and self.process.poll() is None:
+            with suppress(OSError, ValueError):
+                self.ipc(("quit",))
+            try:
+                self.process.wait(timeout=0.8)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=0.8)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        self.cleanup()
+
+    def start(self, source=None, *, video_ids=None):
+        with self.lock:
+            extractor = shutil.which("yt-dlp", path=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", os.defpath))
+            executable = shutil.which("mpv")
+            if not executable or not extractor:
+                raise HTTPException(503, "맥북에 mpv와 yt-dlp를 설치해 주세요.")
+            self.stop()
+            if os.path.lexists(YT_SOCKET):
+                raise HTTPException(409, "mpv 소켓 경로가 이미 사용 중입니다. 웹 서비스의 PrivateTmp 설정을 확인해 주세요.")
+            try:
+                if video_ids is not None:
+                    self.write_queue(video_ids)
+                command = [
+                    executable, "--no-config", "--no-video", "--ytdl=yes", "--ytdl-format=bestaudio/best",
+                    f"--script-opts=ytdl_hook-ytdl_path={extractor}",
+                    f"--ytdl-raw-options=ignore-config=,no-cache-dir=,js-runtimes={YTDLP_JS_RUNTIME},socket-timeout=8,retries=1",
+                    "--ao=alsa", f"--audio-device=alsa/{ALSA_PCM}", f"--input-ipc-server={YT_SOCKET}",
+                    "--input-terminal=no", "--msg-level=all=warn",
+                ]
+                command.extend([f"--playlist={YT_QUEUE}"] if video_ids is not None else ["--", source])
+                env = {key: value for key, value in os.environ.items() if key not in {"REMOTE_KEY", "MPD_PASSWORD"}}
+                self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                umask=0o077, env=env)
+                return {"state": "loading", "title": ""}
+            except OSError:
+                self.cleanup()
+                raise HTTPException(503, "YouTube 플레이어를 시작하지 못했습니다.") from None
+
+    def write_queue(self, video_ids):
+        temporary = None
+        try:
+            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=YT_QUEUE.parent, delete=False) as out:
+                temporary = Path(out.name)
+                out.write("#EXTM3U\n")
+                for video_id in video_ids:
+                    out.write(f"https://music.youtube.com/watch?v={video_id}\n")
+            os.replace(temporary, YT_QUEUE)
+            self.queue_owned = True
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def status(self):
+        if self.process is None:
+            return {"state": "stopped", "title": ""}
+        code = self.process.poll()
+        if code is not None:
+            self.cleanup()
+            return {"state": "error" if code else "stopped", "title": ""}
+        try:
+            title, pause = self.ipc(("get_property", "media-title"), ("get_property", "pause"))
+        except (OSError, ValueError):
+            return {"state": "loading", "title": ""}
+        name = title.get("data")
+        if not isinstance(name, str) or name.startswith(("https://", "http://", "ytdl://")):
+            return {"state": "loading", "title": ""}
+        return {"state": "paused" if pause.get("data") is True else "playing", "title": name}
+
+    def control(self, action):
+        with self.lock:
+            if action == "stop":
+                self.stop()
+            else:
+                if self.process is None or self.process.poll() is not None:
+                    self.cleanup()
+                    raise HTTPException(409, "재생 중인 YouTube 대기열이 없습니다.")
+                try:
+                    result, = self.ipc(YT_CONTROLS[action])
+                except (OSError, ValueError):
+                    raise HTTPException(409, "YouTube 플레이어가 준비되는 중입니다.") from None
+                if result.get("error") != "success":
+                    raise HTTPException(409, "이 방향으로 이동할 곡이 없거나 아직 재생을 준비 중입니다.")
+            return self.status()
+
+
+yt_player = WebYouTubePlayer()
+
+
+def analog_mixer(operation, volume=None):
+    base = ["amixer"]
+    if ALSA_CONTROL_DEVICE:
+        base += ["-D", ALSA_CONTROL_DEVICE]
+    levels = {}
+    applied = []
+    for mixer in MIXERS:
+        args = [*base, operation, mixer]
+        if volume is not None:
+            args += [f"{volume}%", "unmute"]
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=2, check=True,
+                                    env={**os.environ, "LC_ALL": "C"})
+        except (OSError, subprocess.SubprocessError):
+            continue
+        applied.append(mixer)
+        levels_found = re.findall(r"Playback\s+\d+\s+\[(\d+)%\]", result.stdout)
+        if levels_found:
+            levels[mixer] = int(levels_found[0])
+    level = levels.get("Headphone", levels.get("Master"))
+    return {"volume": level if level is not None else (volume if applied else None),
+            "applied": applied, "missing": [name for name in MIXERS if name not in applied]}
+
+
 pcm = PCMReader(FIFO_PATH)
 suspend_lock = Lock()
 
@@ -378,6 +654,7 @@ async def lifespan(_app):
     finally:
         pcm.stop.set()
         await asyncio.to_thread(reader.join, 1.5)
+        await asyncio.to_thread(yt_player.control, "stop")
 
 
 def casaos_origins():
@@ -428,7 +705,8 @@ def page(view):
     html = TEMPLATE.replace("__VIEW__", view).replace("__NONCE__", nonce)
     policy = (
         "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; "
-        "connect-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; style-src 'unsafe-inline'; "
+        "img-src 'self' data: https://*.googleusercontent.com https://*.ytimg.com; "
         f"script-src 'nonce-{nonce}';"
     )
     return HTMLResponse(html, headers={"Content-Security-Policy": policy})
@@ -491,6 +769,89 @@ def remote_status():
 @app.get("/api/system", dependencies=KEY_REQUIRED)
 def remote_system():
     return {**system_stats(), "backlight": backlight_status()}
+
+
+@app.post("/api/ytmusic/auth", dependencies=KEY_REQUIRED)
+async def youtube_auth(request: Request):
+    loopback = {"127.0.0.1", "::1"}
+    local = (request.client and request.client.host in loopback
+             and request.url.hostname in loopback | {"localhost"})
+    if request.url.scheme != "https" and not local:
+        raise HTTPException(403, "인증 헤더는 HTTPS 또는 맥북의 localhost에서 저장해 주세요.")
+    if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+        raise HTTPException(415, "JSON 형식으로 요청해 주세요.")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 65536:
+            raise HTTPException(413, "인증 헤더가 너무 큽니다.")
+        body.extend(chunk)
+    try:
+        raw = json.loads(body)["headers_raw"].strip()
+        if not raw:
+            raise ValueError
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise HTTPException(422, "Request Headers 텍스트를 붙여넣어 주세요.") from None
+    await asyncio.to_thread(save_youtube_auth, raw)
+    return {"connected": True}
+
+
+@app.get("/api/ytmusic/library", dependencies=KEY_REQUIRED)
+def list_youtube_library():
+    if not YT_AUTH.is_file():
+        return {"connected": False, "playlists": []}
+    with youtube_library(YT_AUTH) as library:
+        playlists = library.get_library_playlists(limit=30)[:30]
+    return {"connected": True, "playlists": [
+        {"title": item.get("title") or "제목 없는 재생목록", "count": item.get("count"),
+         "thumbnail": thumbnail_url(item), "playlistId": item["playlistId"]}
+        for item in playlists
+        if PLAYLIST_ID.fullmatch(item.get("playlistId") or "") and item["playlistId"] != "LM"
+    ]}
+
+
+@app.post("/api/ytmusic/play-playlist", dependencies=KEY_REQUIRED, status_code=202)
+def play_youtube_playlist(body: YTPlaylist):
+    with youtube_library(YT_AUTH) as library:
+        result = (library.get_liked_songs(limit=100) if body.playlistId in {"LM", "liked"}
+                  else library.get_playlist(body.playlistId, limit=None))
+    video_ids = [track["videoId"] for track in result.get("tracks", [])
+                 if track.get("isAvailable") is not False and VIDEO_ID.fullmatch(track.get("videoId") or "")]
+    if not video_ids:
+        raise HTTPException(409, "이 재생목록에 재생 가능한 곡이 없습니다.")
+    if body.shuffle:
+        random.shuffle(video_ids)
+    return {**yt_player.start(video_ids=video_ids), "queued": len(video_ids)}
+
+
+@app.post("/api/youtube/play", dependencies=KEY_REQUIRED, status_code=202)
+def play_youtube(body: YouTubeQuery):
+    return yt_player.start(youtube_source(body.query))
+
+
+@app.get("/api/youtube/status", dependencies=KEY_REQUIRED)
+def youtube_status():
+    with yt_player.lock:
+        return yt_player.status()
+
+
+@app.post("/api/youtube/control", dependencies=KEY_REQUIRED)
+def control_youtube(body: YouTubeControl):
+    return yt_player.control(body.action)
+
+
+@app.get("/api/audio/analog-volume", dependencies=KEY_REQUIRED)
+def read_analog_volume():
+    with analog_lock:
+        return analog_mixer("sget")
+
+
+@app.post("/api/audio/analog-volume", dependencies=KEY_REQUIRED)
+def set_analog_volume(body: AnalogVolume):
+    with analog_lock:
+        result = analog_mixer("sset", body.volume)
+    if not result["applied"]:
+        raise HTTPException(503, "ALSA Master와 Headphone을 변경하지 못했습니다. 사운드 카드와 audio 그룹을 확인해 주세요.")
+    return result
 
 
 @app.get("/api/mpd/queue", dependencies=KEY_REQUIRED)
@@ -614,11 +975,11 @@ TEMPLATE = r"""<!doctype html>
 [hidden]{display:none!important}
 html[data-view=remote] .frame,html[data-view=frame] .remote{display:none}
 h1,h2,h3,p{margin:0}a{color:var(--accent)}button,input,textarea{font:inherit}
-button,input[type=password],textarea{border:1px solid var(--line);border-radius:.75rem;padding:.65rem .85rem}
+button,input[type=password],input[type=search],textarea{border:1px solid var(--line);border-radius:.75rem;padding:.65rem .85rem}
 button{background:rgb(15 23 42/.56);color:var(--ink);cursor:pointer;min-height:44px}
 button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 button:disabled{opacity:.5;cursor:default}.primary{background:var(--accent);color:#172554;border-color:transparent;font-weight:700}
-.danger{color:var(--warn)}input[type=password],textarea{background:rgb(15 23 42/.72);color:var(--ink);width:100%;min-width:0}
+.danger{color:var(--warn)}input[type=password],input[type=search],textarea{background:rgb(15 23 42/.72);color:var(--ink);width:100%;min-width:0}
 input[type=range]{width:100%;min-height:35px;accent-color:var(--accent)}
 .shell{width:min(100% - 1.75rem,60rem);margin:auto;padding:1.5rem 0 2.5rem}
 .row{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}.split{justify-content:space-between}
@@ -655,6 +1016,16 @@ input[type=range]{width:100%;min-height:35px;accent-color:var(--accent)}
 .upload-help{padding:.8rem;border:1px solid var(--line);border-radius:.8rem;background:rgb(15 23 42/.44)}
 .upload-help p{margin-bottom:.6rem;color:var(--muted);font-size:.88rem;overflow-wrap:anywhere}
 .upload-help code{color:var(--ink)}
+.yt-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.55rem;margin:.65rem 0 .9rem}
+.yt-playlists{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,12rem),1fr));gap:.5rem;
+ max-height:17rem;overflow:auto;margin:.65rem 0 .9rem}
+.yt-playlists button{display:flex;align-items:center;gap:.55rem;text-align:left;min-width:0;overflow-wrap:anywhere}
+.yt-playlists img{width:2.1rem;height:2.1rem;object-fit:cover;border-radius:.35rem;flex:none}
+.yt-playlists small{display:block}
+.yt-player{border-top:1px solid var(--line);padding-top:.75rem;margin-top:.65rem;overflow-wrap:anywhere}
+.yt-player .row+.row{margin-top:.65rem}
+.yt-status{margin:.45rem 0;min-height:1.1rem}
+#yt-auth-headers{resize:vertical;min-height:8rem}
 dialog{position:fixed;inset:0;margin:auto;width:min(28rem,calc(100% - 2rem));border:1px solid var(--line);
  background:#1e293b;color:var(--ink);border-radius:1rem;padding:1.15rem}
 dialog::backdrop{background:#000b}dialog p{margin:.65rem 0 1rem;color:var(--muted)}
@@ -720,6 +1091,41 @@ dialog::backdrop{background:#000b}dialog p{margin:.65rem 0 1rem;color:var(--mute
     </div>
    </section>
   </section>
+  <section class="panel glass backdrop-blur-md bg-white/10 border border-white/15 rounded-2xl wide" aria-labelledby="yt-title">
+   <div class="row split"><h2 id="yt-title">YouTube Music 내 보관함 &amp; 검색</h2><small id="yt-library-status"></small></div>
+   <form id="yt-search" class="yt-search">
+    <input id="yt-query" type="search" aria-label="YouTube 검색어 또는 주소" placeholder="곡 이름, 가수 또는 YouTube 주소" maxlength="500" required>
+    <button id="yt-search-button" class="primary" type="submit">바로 재생</button>
+   </form>
+   <div class="row">
+    <button class="primary" id="yt-liked" type="button" disabled>내 좋아요 표시한 음악 셔플 재생</button>
+    <label><input id="yt-shuffle" type="checkbox"> 재생목록 셔플</label>
+   </div>
+   <div class="yt-playlists" id="yt-playlists" aria-label="내 재생목록"></div>
+   <div class="yt-player">
+    <div class="row split"><strong id="yt-playing">재생 대기</strong><small id="yt-player-state"></small></div>
+    <div class="row" aria-label="YouTube 재생 제어">
+     <button type="button" data-yt-action="prev" disabled>이전곡</button>
+     <button type="button" data-yt-action="pause" disabled>일시정지</button>
+     <button type="button" data-yt-action="next" disabled>다음곡</button>
+     <button type="button" data-yt-action="stop" disabled>정지</button>
+    </div>
+    <p id="yt-action-result" class="muted yt-status" role="status"></p>
+    <div class="row">
+     <button type="button" id="yt-auth-open">계정 연동(Request Headers 붙여넣기)</button>
+     <button type="button" id="yt-library-refresh">보관함 새로고침</button>
+    </div>
+   </div>
+  </section>
+  <section class="panel glass backdrop-blur-md bg-white/10 border border-white/15 rounded-2xl wide" aria-labelledby="analog-title">
+   <h2 id="analog-title">3.5mm 아날로그(RCA) 볼륨</h2>
+   <div class="row split"><label for="analog-volume">헤드폰 출력</label><output id="analog-value" for="analog-volume">—</output></div>
+   <input id="analog-volume" type="range" min="0" max="100" value="0" disabled>
+   <div class="row">
+    <button type="button" id="analog-preset" disabled>스피커 최적 볼륨 (85%)</button>
+    <small id="analog-result" role="status"></small>
+   </div>
+  </section>
   <section class="panel glass backdrop-blur-md bg-white/10 border border-white/15 rounded-2xl">
    <h2>음성 메모</h2>
    <form class="form-stack" id="memo-form">
@@ -755,6 +1161,16 @@ dialog::backdrop{background:#000b}dialog p{margin:.65rem 0 1rem;color:var(--mute
    <button type="button" id="confirm-yes" class="primary">확인</button>
   </div>
  </dialog>
+ <dialog id="yt-auth-dialog" aria-labelledby="yt-auth-title">
+  <h2 id="yt-auth-title">YouTube Music 계정 연동</h2>
+  <p>YouTube Music에 로그인한 브라우저에서 F12 → Network → <code>browse</code> 요청의 Request Headers를 복사해 붙여넣으세요.</p>
+  <form id="yt-auth-form" class="form-stack" autocomplete="off">
+   <label for="yt-auth-headers">Request Headers</label>
+   <textarea id="yt-auth-headers" spellcheck="false" maxlength="32000" required></textarea>
+   <small id="yt-auth-result" role="status"></small>
+   <div class="row"><button type="button" id="yt-auth-close">닫기</button><button type="submit" class="primary" id="yt-auth-save">검증 후 저장</button></div>
+  </form>
+ </dialog>
 </main>
 <main class="frame">
  <div class="frame-shell">
@@ -781,12 +1197,12 @@ $("casaos-link").href = `http://${window.location.hostname}:80`;
 const stateText = {play:"재생 중",pause:"일시 정지",stop:"정지"};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function api(path, {method="GET", body, key=""} = {}) {
+async function api(path, {method="GET", body, key="", timeout=9500} = {}) {
   const headers = {Accept:"application/json"};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (key) headers["X-Remote-Key"] = key;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 9500);
+  const timer = setTimeout(() => controller.abort(), timeout);
   try {
     const response = await fetch(path, {method,headers,body:JSON.stringify(body),
       cache:"no-store",signal:controller.signal,redirect:"error"});
@@ -904,7 +1320,202 @@ if (isFrame) {
   const metric = (value,unit) => value == null ? "—" : value+" "+unit;
   const message = text => { $("notice").textContent = text; };
   const explain = error => error.status ? error.message : "서버에 연결할 수 없습니다.";
-  const call = (path,method,body) => api(path,{method,body,key});
+  const call = (path,method,body,timeout) => api(path,{method,body,key,timeout});
+
+  const ytButtons = [...document.querySelectorAll("[data-yt-action]")];
+  const authDialog = $("yt-auth-dialog");
+  const authHeaders = $("yt-auth-headers");
+  const secureAuth = location.protocol === "https:" || ["localhost","127.0.0.1","[::1]"].includes(location.hostname);
+  let ytState = "stopped";
+  let ytBusy = false;
+  let ytVersion = 0;
+  let libraryVersion = 0;
+  let libraryConnected = false;
+  let analogBusy = false;
+
+  function showPlayer(data) {
+    const labels = {loading:"불러오는 중",playing:"재생 중",paused:"일시 정지",
+      stopped:"정지",error:"재생 실패 · mpv 서비스 로그를 확인해 주세요"};
+    ytState = data.state;
+    $("yt-playing").textContent = data.title || (data.state === "loading" ? "곡을 불러오는 중…" : "재생 대기");
+    $("yt-player-state").textContent = labels[data.state] || "";
+    $("yt-search-button").disabled = ytBusy;
+    $("yt-liked").disabled = ytBusy || !libraryConnected;
+    $("yt-playlists").querySelectorAll("button").forEach(button => { button.disabled = ytBusy; });
+    ytButtons.forEach(button => {
+      button.disabled = ytBusy || !["loading","playing","paused"].includes(ytState)
+        || (ytState === "loading" && button.dataset.ytAction !== "stop");
+      if (button.dataset.ytAction === "pause") button.textContent = ytState === "paused" ? "다시 재생" : "일시정지";
+    });
+  }
+
+  async function refreshYouTube() {
+    if (!connected || ytBusy) return;
+    const session = epoch, version = ytVersion;
+    try {
+      const data = await call("/api/youtube/status");
+      if (session === epoch && version === ytVersion) showPlayer(data);
+    } catch (error) {
+      if (session !== epoch || version !== ytVersion) return;
+      if (error.status === 401) showError(error);
+      else $("yt-player-state").textContent = "YouTube 플레이어 상태 확인 실패";
+    }
+  }
+
+  async function youtubeAction(path, body) {
+    if (ytBusy || !connected) return;
+    const session = epoch;
+    const result = $("yt-action-result");
+    ++ytVersion;
+    ytBusy = true;
+    showPlayer({state:ytState,title:$("yt-playing").textContent});
+    result.textContent = "요청 처리 중…";
+    try {
+      const data = await call(path,"POST",body,60000);
+      if (session !== epoch) return;
+      ytBusy = false;
+      showPlayer(data);
+      result.textContent = data.queued ? data.queued+"곡을 재생 대기열에 넣었습니다." : "";
+    } catch (error) {
+      if (session !== epoch) return;
+      ytBusy = false;
+      if (error.status === 401) showError(error);
+      else {
+        result.textContent = explain(error);
+        showPlayer({state:ytState,title:$("yt-playing").textContent});
+        await refreshYouTube();
+      }
+    }
+  }
+
+  async function refreshYouTubeLibrary() {
+    if (!connected) return;
+    const session = epoch, version = ++libraryVersion;
+    const label = $("yt-library-status");
+    label.textContent = "보관함 확인 중…";
+    try {
+      const data = await call("/api/ytmusic/library","GET",undefined,30000);
+      if (session !== epoch || version !== libraryVersion) return;
+      libraryConnected = data.connected;
+      label.textContent = data.connected ? "계정 연동됨" : "계정 연동 필요";
+      const items = data.playlists.map(playlist => {
+        const button = document.createElement("button");
+        const info = document.createElement("span");
+        const title = document.createElement("strong");
+        const count = document.createElement("small");
+        button.type = "button";
+        button.disabled = ytBusy;
+        if (playlist.thumbnail) {
+          const img = document.createElement("img");
+          img.src = playlist.thumbnail;
+          img.loading = "lazy";
+          img.alt = "";
+          button.append(img);
+        }
+        title.textContent = playlist.title;
+        count.textContent = playlist.count == null ? "" : playlist.count+"곡";
+        info.append(title,count);
+        button.append(info);
+        button.onclick = () => youtubeAction("/api/ytmusic/play-playlist",{
+          playlistId:playlist.playlistId,shuffle:$("yt-shuffle").checked
+        });
+        return button;
+      });
+      if (!items.length && data.connected) label.textContent = "계정 연동됨 · 재생목록 없음";
+      $("yt-playlists").replaceChildren(...items);
+      $("yt-liked").disabled = ytBusy || !libraryConnected;
+    } catch (error) {
+      if (session !== epoch || version !== libraryVersion) return;
+      if (error.status === 401) showError(error);
+      else label.textContent = explain(error);
+    }
+  }
+
+  $("yt-search").onsubmit = event => {
+    event.preventDefault();
+    youtubeAction("/api/youtube/play",{query:$("yt-query").value.trim()});
+  };
+  $("yt-liked").onclick = () => youtubeAction("/api/ytmusic/play-playlist",{playlistId:"liked",shuffle:true});
+  ytButtons.forEach(button => { button.onclick = () => youtubeAction("/api/youtube/control",{action:button.dataset.ytAction}); });
+  $("yt-library-refresh").onclick = refreshYouTubeLibrary;
+  $("yt-auth-open").onclick = () => {
+    authHeaders.value = "";
+    authHeaders.disabled = !secureAuth;
+    $("yt-auth-save").disabled = !secureAuth;
+    $("yt-auth-result").textContent = secureAuth ? "" : "인증 헤더를 저장하려면 HTTPS 또는 localhost로 접속하세요.";
+    authDialog.showModal();
+  };
+  $("yt-auth-close").onclick = () => { authHeaders.value = ""; authDialog.close(); };
+  authDialog.addEventListener("cancel",() => { authHeaders.value = ""; });
+  $("yt-auth-form").onsubmit = async event => {
+    event.preventDefault();
+    if (!secureAuth) return;
+    const session = epoch;
+    const raw = authHeaders.value.trim();
+    if (!raw) return;
+    const save = $("yt-auth-save"), result = $("yt-auth-result");
+    save.disabled = true;
+    $("yt-auth-close").disabled = true;
+    authHeaders.value = "";
+    authHeaders.disabled = true;
+    result.textContent = "연동 확인 중…";
+    try {
+      await call("/api/ytmusic/auth","POST",{headers_raw:raw},30000);
+      if (session !== epoch) return;
+      authDialog.close();
+      $("yt-action-result").textContent = "YouTube Music 계정을 연동했습니다.";
+      await refreshYouTubeLibrary();
+    } catch (error) {
+      if (session !== epoch) return;
+      if (error.status === 401) showError(error);
+      else result.textContent = explain(error);
+    } finally {
+      $("yt-auth-close").disabled = false;
+      if (session === epoch) {
+        save.disabled = false;
+        authHeaders.disabled = false;
+      }
+    }
+  };
+
+  function showAnalog(data) {
+    $("analog-volume").disabled = data.volume == null;
+    $("analog-preset").disabled = data.volume == null;
+    $("analog-volume").value = data.volume ?? 0;
+    $("analog-value").textContent = metric(data.volume,"%");
+    $("analog-result").textContent = data.applied.length
+      ? (data.missing.length ? data.applied.join(", ")+"만 적용 가능 · "+data.missing.join(", ")+" 확인" : "")
+      : "ALSA Master·Headphone 믹서를 찾을 수 없습니다.";
+  }
+
+  async function analogVolume(value) {
+    if (analogBusy || !connected) return;
+    const session = epoch;
+    const writing = value !== undefined;
+    const available = !$("analog-volume").disabled;
+    analogBusy = true;
+    $("analog-volume").disabled = true;
+    $("analog-preset").disabled = true;
+    try {
+      const data = await call("/api/audio/analog-volume",writing ? "POST" : "GET",writing ? {volume:value} : undefined);
+      if (session !== epoch) return;
+      showAnalog(data);
+    } catch (error) {
+      if (session !== epoch) return;
+      if (error.status === 401) showError(error);
+      else {
+        $("analog-result").textContent = explain(error);
+        $("analog-volume").disabled = !available;
+        $("analog-preset").disabled = !available;
+      }
+    } finally {
+      if (session === epoch) analogBusy = false;
+    }
+  }
+
+  $("analog-volume").oninput = () => { $("analog-value").textContent = metric($("analog-volume").value,"%"); };
+  $("analog-volume").onchange = () => analogVolume(Number($("analog-volume").value));
+  $("analog-preset").onclick = () => analogVolume(85);
 
   function lock() {
     epoch++;
@@ -913,6 +1524,16 @@ if (isFrame) {
     musicBusy = false;
     backlightBusy = false;
     editingVolume = false;
+    ytBusy = false;
+    analogBusy = false;
+    libraryConnected = false;
+    $("yt-playlists").replaceChildren();
+    $("yt-query").value = "";
+    $("yt-action-result").textContent = "";
+    $("yt-library-status").textContent = "";
+    authHeaders.value = "";
+    if (authDialog.open) authDialog.close();
+    showPlayer({state:"stopped",title:""});
     try { sessionStorage.removeItem("macbookRemoteKey"); } catch {}
     $("memos").replaceChildren();
     $("memo").value = "";
@@ -1072,7 +1693,8 @@ if (isFrame) {
       $("dashboard").hidden = false;
       message("");
       remoteMusic(data.music,data.music_error);
-      await Promise.all([refreshSystem(),refreshMemos(),refreshQueue()]);
+      await Promise.all([refreshSystem(),refreshMemos(),refreshQueue(),
+        refreshYouTubeLibrary(),refreshYouTube(),analogVolume()]);
     } catch (error) {
       if (session === epoch) showError(error);
     }
@@ -1206,6 +1828,7 @@ if (isFrame) {
   };
   $("volume").onpointercancel = () => { editingVolume = false; refreshMusic(); };
   repeat(refreshMusic,2500);
+  repeat(refreshYouTube,3000);
   repeat(refreshQueue,10000);
   repeat(refreshSystem,10000);
   repeat(async () => { if (connected) await refreshMemos(); },15000);
@@ -1219,4 +1842,5 @@ if (isFrame) {
 
 if __name__ == "__main__":
     uvicorn.run(app, host=REMOTE_HOST, port=REMOTE_PORT, workers=1,
-                access_log=False, timeout_keep_alive=5)
+                access_log=False, timeout_keep_alive=5, proxy_headers=TRUST_LOCAL_PROXY,
+                forwarded_allow_ips="127.0.0.1,::1")

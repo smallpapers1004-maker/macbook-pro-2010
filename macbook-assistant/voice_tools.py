@@ -151,17 +151,23 @@ class VoiceTools:
     def _set_system_volume(self, level):
         backend = self.config.volume_backend
         if backend in {"auto", "alsa"}:
-            try:
-                command = ["amixer"]
-                if self.config.alsa_control_device:
-                    command.extend(("-D", self.config.alsa_control_device))
-                command.extend(("sset", "Master", f"{level}%"))
-                subprocess.run(command, capture_output=True, timeout=3, check=True)
+            command = ["amixer"]
+            if self.config.alsa_control_device:
+                command.extend(("-D", self.config.alsa_control_device))
+            applied = []
+            for control in ("Master", "Headphone"):
+                try:
+                    subprocess.run([*command, "sset", control, f"{level}%", "unmute"],
+                                   capture_output=True, timeout=3, check=True)
+                    applied.append(control)
+                except COMMAND_ERRORS as error:
+                    LOG.warning("ALSA %s volume failed (%s)", control, type(error).__name__)
+            if len(applied) == 2:
                 return f"시스템 볼륨을 {level}퍼센트로 설정했습니다."
-            except COMMAND_ERRORS as error:
-                LOG.warning("ALSA Master volume failed (%s)", type(error).__name__)
-                if backend == "alsa":
-                    return "ALSA Master 볼륨을 변경하지 못했습니다."
+            if applied:
+                return f"ALSA에서 {applied[0]} 볼륨을 {level}퍼센트로 설정했습니다."
+            if backend == "alsa":
+                return "ALSA Master와 Headphone 볼륨을 변경하지 못했습니다."
         try:
             with mpd_connection(self.config) as client:
                 client.setvol(level)
