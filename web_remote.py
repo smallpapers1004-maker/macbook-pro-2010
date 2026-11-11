@@ -61,6 +61,9 @@ REMOTE_PORT = 8080
 YT_AUTH = Path("/opt/macbook-assistant/browser.json")
 YT_SOCKET = Path("/tmp/mpv-yt.sock")
 YT_QUEUE = Path("/tmp/ytmusic_queue.m3u")
+YT_SHORTCUTS = Path("/var/lib/macbook-assistant/ytmusic-shortcuts.json")
+SHORTCUT_LIMIT = 5
+MPD_OUTPUT_HELPER = "/usr/local/sbin/macbook-mpd-output"
 ALSA_PCM = os.getenv("ALSA_PCM", "default")
 ALSA_CONTROL_DEVICE = os.getenv("ALSA_CONTROL_DEVICE", "")
 YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME", "deno")
@@ -74,6 +77,7 @@ YT_CONTROLS = {
 }
 MIXERS = ("Master", "Headphone")
 analog_lock = Lock()
+shortcut_lock = Lock()
 
 
 class MusicAction(BaseModel):
@@ -104,6 +108,17 @@ class YouTubeControl(BaseModel):
 
 class AnalogVolume(BaseModel):
     volume: int = Field(ge=0, le=100, strict=True)
+
+
+class MPDOutput(BaseModel):
+    output: Literal["speaker", "optical"]
+
+
+class ShortcutChange(BaseModel):
+    action: Literal["save", "remove"]
+    title: str = Field(default="", max_length=300)
+    playlistId: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,150}$")
+    url: str | None = Field(default=None, max_length=500)
 
 
 def require_key(request: Request):
@@ -183,7 +198,7 @@ def memo_entries():
         raise HTTPException(503, "메모 파일의 권한이나 형식을 확인해 주세요.") from exc
 
 
-def save_memos(path, entries):
+def save_json(path, entries):
     temp_path = None
     try:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as temp:
@@ -771,6 +786,42 @@ def remote_system():
     return {**system_stats(), "backlight": backlight_status()}
 
 
+def mpd_output_command(action):
+    try:
+        result = subprocess.run([SUDO, "-n", MPD_OUTPUT_HELPER, action], capture_output=True,
+                                text=True, timeout=45, stdin=subprocess.DEVNULL)
+        response = json.loads(result.stdout)
+        if not isinstance(response, dict):
+            raise ValueError("Invalid output helper reply")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(503, "MPD 출력 전환이 지연되고 있습니다. 잠시 후 상태를 확인해 주세요.") from None
+    except (OSError, ValueError):
+        raise HTTPException(503, "MPD 출력 전환 도구와 sudoers 설정을 확인해 주세요.") from None
+    if result.returncode == 0 and response.get("output") in {"speaker", "optical"}:
+        return response
+    errors = {
+        "configuration": "MPD에서 전환할 ALSA 출력 한 개를 지정하고 device에 DEV=0 또는 DEV=1을 설정해 주세요.",
+        "permissions": "MPD 설정 파일과 전환 도구의 권한을 확인해 주세요.",
+        "busy": "다른 MPD 출력 전환이 진행 중입니다.",
+        "config_changed": "MPD 설정이 동시에 변경됐습니다. 현재 설정을 확인해 주세요.",
+        "rolled_back": "새 출력에서 MPD를 시작하지 못해 기존 출력으로 복구했습니다.",
+        "recovery_failed": "MPD 재시작과 복구 중 오류가 발생했습니다. 맥북의 MPD 상태를 확인해 주세요.",
+    }
+    code = response.get("error")
+    raise HTTPException(409 if code in {"busy", "config_changed"} else 503,
+                        errors.get(code, "MPD 출력 전환 도구의 응답을 확인해 주세요."))
+
+
+@app.get("/api/mpd/output", dependencies=KEY_REQUIRED)
+def read_mpd_output():
+    return mpd_output_command("status")
+
+
+@app.post("/api/mpd/output", dependencies=KEY_REQUIRED)
+def change_mpd_output(body: MPDOutput):
+    return mpd_output_command(body.output)
+
+
 @app.post("/api/ytmusic/auth", dependencies=KEY_REQUIRED)
 async def youtube_auth(request: Request):
     loopback = {"127.0.0.1", "::1"}
@@ -807,6 +858,67 @@ def list_youtube_library():
         for item in playlists
         if PLAYLIST_ID.fullmatch(item.get("playlistId") or "") and item["playlistId"] != "LM"
     ]}
+
+
+def load_youtube_shortcuts():
+    try:
+        items = json.loads(YT_SHORTCUTS.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    if not isinstance(items, list) or len(items) > SHORTCUT_LIMIT or any(
+        not isinstance(item, dict) or not isinstance(item.get("title"), str)
+        or (isinstance(item.get("playlistId"), str) == isinstance(item.get("url"), str))
+        for item in items
+    ):
+        raise ValueError("Invalid YouTube shortcut data")
+    return items
+
+
+@app.get("/api/ytmusic/shortcuts", dependencies=KEY_REQUIRED)
+def list_youtube_shortcuts():
+    try:
+        with shortcut_lock:
+            return {"items": load_youtube_shortcuts()}
+    except (OSError, ValueError):
+        raise HTTPException(503, "저장된 YouTube 바로가기를 읽지 못했습니다.") from None
+
+
+@app.post("/api/ytmusic/shortcuts", dependencies=KEY_REQUIRED)
+def change_youtube_shortcut(body: ShortcutChange):
+    if (body.playlistId is None) == (body.url is None):
+        raise HTTPException(422, "보관함 재생목록 또는 YouTube 재생목록 주소를 하나 지정해 주세요.")
+    if body.url is not None:
+        url = youtube_source(body.url)
+        if not url.startswith("https://www.youtube.com/playlist?list="):
+            raise HTTPException(422, "동영상 주소 대신 YouTube 재생목록 공유 주소를 입력해 주세요.")
+        field, value = "url", url
+    else:
+        field = "playlistId"
+        value = "liked" if body.playlistId in {"liked", "LM"} else body.playlistId
+    title = body.title.strip()
+    if body.action == "save" and not title:
+        raise HTTPException(422, "바로가기 이름을 입력해 주세요.")
+
+    try:
+        with shortcut_lock:
+            items = load_youtube_shortcuts()
+            index = next((index for index, item in enumerate(items) if item.get(field) == value), None)
+            if body.action == "remove":
+                if index is not None:
+                    del items[index]
+                    save_json(YT_SHORTCUTS, items)
+            else:
+                item = {"title": title, field: value}
+                if index is not None:
+                    items[index] = item
+                elif len(items) >= SHORTCUT_LIMIT:
+                    raise HTTPException(409, "바로가기는 5개까지 등록할 수 있습니다. 기존 바로가기를 하나 삭제해 주세요.")
+                else:
+                    items.append(item)
+                save_json(YT_SHORTCUTS, items)
+            return {"items": items}
+    except (OSError, ValueError):
+        raise HTTPException(503, "YouTube 바로가기 파일을 변경하지 못했습니다.") from None
 
 
 @app.post("/api/ytmusic/play-playlist", dependencies=KEY_REQUIRED, status_code=202)
@@ -919,7 +1031,7 @@ def add_memo(body: MemoInput):
     with memo_entries() as (path, entries, _):
         entries.append({"time": datetime.now().astimezone().isoformat(timespec="seconds"),
                         "content": content})
-        save_memos(path, entries)
+        save_json(path, entries)
     return {"ok": True}
 
 
@@ -929,7 +1041,7 @@ def delete_memo(index: int, body: MemoRemoval):
         if body.revision != revision or not 0 <= index < len(entries):
             raise HTTPException(409, "메모 목록이 바뀌었습니다. 목록을 확인하고 다시 삭제해 주세요.")
         del entries[index]
-        save_memos(path, entries)
+        save_json(path, entries)
     return {"ok": True}
 
 
@@ -1025,6 +1137,17 @@ input[type=range]{width:100%;min-height:35px;accent-color:var(--accent)}
 .yt-player{border-top:1px solid var(--line);padding-top:.75rem;margin-top:.65rem;overflow-wrap:anywhere}
 .yt-player .row+.row{margin-top:.65rem}
 .yt-status{margin:.45rem 0;min-height:1.1rem}
+.shortcuts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,10rem),1fr));gap:.5rem;margin:.25rem 0 .75rem}
+.shortcuts button,.shortcut-manage li span{overflow-wrap:anywhere;text-align:left}
+.shortcut-manage summary{cursor:pointer;color:var(--accent);width:fit-content;padding:.35rem 0}
+.shortcut-manage form{margin-top:.65rem}
+.shortcut-manage select{min-width:0;max-width:100%;flex:1 1 10rem;font:inherit;color:var(--ink);
+ background:#0f172a;border:1px solid var(--line);border-radius:.65rem;padding:.55rem}
+.shortcut-manage ul{list-style:none;padding:0;margin:.55rem 0 0}
+.shortcut-manage li{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.28rem 0}
+.shortcut-manage li button{flex:none}
+.mpd-output{margin-top:.7rem;padding:.75rem;border:1px solid var(--line);border-radius:.8rem}
+.mpd-output button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
 #yt-auth-headers{resize:vertical;min-height:8rem}
 dialog{position:fixed;inset:0;margin:auto;width:min(28rem,calc(100% - 2rem));border:1px solid var(--line);
  background:#1e293b;color:var(--ink);border-radius:1rem;padding:1.15rem}
@@ -1069,6 +1192,27 @@ dialog::backdrop{background:#000b}dialog p{margin:.65rem 0 1rem;color:var(--mute
  </form>
  <p id="notice" class="notice" role="status"></p>
  <div id="dashboard" class="grid-remote" hidden>
+  <section class="panel glass backdrop-blur-md bg-white/10 border border-white/15 rounded-2xl wide" aria-labelledby="shortcut-heading">
+   <div class="row split"><h2 id="shortcut-heading">YouTube 바로가기</h2><small id="shortcut-count">0 / 5</small></div>
+   <div class="shortcuts" id="yt-shortcuts"></div>
+   <small id="shortcut-result" role="status"></small>
+   <details class="shortcut-manage">
+    <summary>바로가기 관리</summary>
+    <form class="row" id="shortcut-library-form">
+     <label for="shortcut-library">보관함</label>
+     <select id="shortcut-library" aria-label="보관함 재생목록"></select>
+     <button type="submit" id="shortcut-library-add" disabled>등록</button>
+    </form>
+    <form class="form-stack" id="shortcut-url-form">
+     <label for="shortcut-name">바로가기 이름</label>
+     <input id="shortcut-name" type="search" maxlength="300" required>
+     <label for="shortcut-url">YouTube 재생목록 공유 주소</label>
+     <input id="shortcut-url" type="search" inputmode="url" placeholder="https://www.youtube.com/playlist?list=…" maxlength="500" required>
+     <div><button type="submit" id="shortcut-url-add">주소로 등록</button></div>
+    </form>
+    <ul id="shortcut-remove-list" aria-label="등록된 바로가기 삭제"></ul>
+   </details>
+  </section>
   <section class="panel glass backdrop-blur-md bg-white/10 border border-white/15 rounded-2xl wide" aria-labelledby="remote-song">
    <div class="row split"><p class="kicker uppercase tracking-widest">Now Playing</p><small id="remote-state">연결 중</small></div>
    <h3 id="remote-song" class="track">—</h3><p id="remote-meta" class="metadata"></p>
@@ -1079,6 +1223,11 @@ dialog::backdrop{background:#000b}dialog p{margin:.65rem 0 1rem;color:var(--mute
    </div>
    <div class="row split"><label for="volume">볼륨</label><output id="volume-value" for="volume">—</output></div>
    <input id="volume" type="range" min="0" max="100" value="0" disabled>
+   <div class="mpd-output row">
+    <button type="button" id="mpd-output-toggle" aria-pressed="false" disabled>내장 스피커 ↔ 광출력(DAC)</button>
+    <small id="mpd-output-state" role="status">MPD 출력 확인 중</small>
+    <button type="button" id="mpd-output-refresh">상태 확인</button>
+   </div>
    <section class="queue" aria-labelledby="queue-title">
     <div class="row split"><h2 id="queue-title">재생 대기열</h2><small id="queue-state">대기열 확인 중</small></div>
     <ol class="queue-list" id="queue-list"></ol>
@@ -1333,6 +1482,136 @@ if (isFrame) {
   let libraryConnected = false;
   let analogBusy = false;
 
+  let shortcuts = [];
+  let shortcutPlaylists = [];
+  let shortcutBusy = false;
+  let mpdOutput = null;
+  let mpdOutputBusy = false;
+  const shortcutResult = $("shortcut-result");
+  const mpdOutputLabels = {speaker:"내장 스피커",optical:"광출력(DAC)"};
+
+  function shortcutOptions() {
+    const select = $("shortcut-library");
+    const selected = select.value;
+    const choices = shortcutPlaylists.filter(item => !shortcuts.some(saved => saved.playlistId === item.playlistId));
+    select.replaceChildren(new Option(libraryConnected ? "재생목록 선택" : "YouTube Music 계정 연동 필요",""),
+      ...choices.map(item => new Option(item.title,item.playlistId)));
+    select.value = choices.some(item => item.playlistId === selected) ? selected : "";
+    $("shortcut-library-add").disabled = shortcutBusy || !select.value;
+    $("shortcut-url-add").disabled = shortcutBusy;
+  }
+
+  function showShortcuts(items) {
+    shortcuts = items;
+    $("shortcut-count").textContent = items.length+" / 5";
+    const buttons = [], rows = [];
+    for (const item of items) {
+      const target = item.url ? {url:item.url} : {playlistId:item.playlistId};
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "primary";
+      button.textContent = item.title;
+      button.disabled = ytBusy;
+      button.onclick = () => {
+        if (item.url) youtubeAction("/api/youtube/play",{query:item.url},shortcutResult);
+        else youtubeAction("/api/ytmusic/play-playlist",{...target,shuffle:item.playlistId === "liked" || $("yt-shuffle").checked},shortcutResult);
+      };
+      buttons.push(button);
+      const row = document.createElement("li");
+      const title = document.createElement("span");
+      const remove = document.createElement("button");
+      title.textContent = item.title;
+      remove.type = "button";
+      remove.textContent = "삭제";
+      remove.setAttribute("aria-label",item.title+" 바로가기 삭제");
+      remove.disabled = shortcutBusy;
+      remove.onclick = () => updateShortcuts({action:"remove",...target});
+      row.append(title,remove);
+      rows.push(row);
+    }
+    $("yt-shortcuts").replaceChildren(...buttons);
+    $("shortcut-remove-list").replaceChildren(...rows);
+    shortcutOptions();
+  }
+
+  async function updateShortcuts(body) {
+    if (shortcutBusy || !connected) return;
+    const session = epoch;
+    shortcutBusy = true;
+    shortcutOptions();
+    $("shortcut-remove-list").querySelectorAll("button").forEach(button => { button.disabled = true; });
+    try {
+      const data = await call("/api/ytmusic/shortcuts",body ? "POST" : "GET",body);
+      if (session !== epoch) return;
+      shortcuts = data.items;
+      if (body) shortcutResult.textContent = body.action === "save" ? "바로가기를 등록했습니다." : "바로가기를 삭제했습니다.";
+      if (body?.action === "save" && body.url) {
+        $("shortcut-url").value = "";
+        $("shortcut-name").value = "";
+      }
+    } catch (error) {
+      if (session !== epoch) return;
+      if (error.status === 401) showError(error);
+      else shortcutResult.textContent = explain(error);
+    } finally {
+      if (session === epoch) {
+        shortcutBusy = false;
+        showShortcuts(shortcuts);
+      }
+    }
+  }
+
+  $("shortcut-library").onchange = shortcutOptions;
+  $("shortcut-library-form").onsubmit = event => {
+    event.preventDefault();
+    const selected = shortcutPlaylists.find(item => item.playlistId === $("shortcut-library").value);
+    if (selected) updateShortcuts({action:"save",title:selected.title,playlistId:selected.playlistId});
+  };
+  $("shortcut-url-form").onsubmit = event => {
+    event.preventDefault();
+    updateShortcuts({action:"save",title:$("shortcut-name").value,url:$("shortcut-url").value});
+  };
+
+  async function mpdOutputRequest(output) {
+    if (mpdOutputBusy || !connected) return;
+    const session = epoch;
+    const button = $("mpd-output-toggle");
+    const state = $("mpd-output-state");
+    mpdOutputBusy = true;
+    button.disabled = true;
+    $("mpd-output-refresh").disabled = true;
+    state.textContent = output ? "MPD 출력 전환 중…" : "MPD 출력 확인 중";
+    try {
+      const data = await call("/api/mpd/output",output ? "POST" : "GET",output ? {output} : undefined,47000);
+      if (session !== epoch) return;
+      mpdOutput = data.output;
+      state.textContent = "현재 MPD 설정 · "+mpdOutputLabels[mpdOutput];
+      if (output) {
+        refreshMusic();
+        refreshQueue();
+      }
+    } catch (error) {
+      if (session !== epoch) return;
+      if (error.status === 401) showError(error);
+      else {
+        mpdOutput = null;
+        state.textContent = explain(error);
+      }
+    } finally {
+      if (session === epoch) {
+        mpdOutputBusy = false;
+        button.disabled = mpdOutput == null;
+        button.setAttribute("aria-pressed",String(mpdOutput === "optical"));
+        $("mpd-output-refresh").disabled = false;
+      }
+    }
+  }
+
+  $("mpd-output-toggle").onclick = () => {
+    if (mpdOutput) mpdOutputRequest(mpdOutput === "optical" ? "speaker" : "optical");
+  };
+  $("mpd-output-refresh").onclick = () => mpdOutputRequest();
+
   function showPlayer(data) {
     const labels = {loading:"불러오는 중",playing:"재생 중",paused:"일시 정지",
       stopped:"정지",error:"재생 실패 · mpv 서비스 로그를 확인해 주세요"};
@@ -1341,7 +1620,7 @@ if (isFrame) {
     $("yt-player-state").textContent = labels[data.state] || "";
     $("yt-search-button").disabled = ytBusy;
     $("yt-liked").disabled = ytBusy || !libraryConnected;
-    $("yt-playlists").querySelectorAll("button").forEach(button => { button.disabled = ytBusy; });
+    document.querySelectorAll("#yt-playlists button, #yt-shortcuts button").forEach(button => { button.disabled = ytBusy; });
     ytButtons.forEach(button => {
       button.disabled = ytBusy || !["loading","playing","paused"].includes(ytState)
         || (ytState === "loading" && button.dataset.ytAction !== "stop");
@@ -1362,10 +1641,9 @@ if (isFrame) {
     }
   }
 
-  async function youtubeAction(path, body) {
+  async function youtubeAction(path, body, result=$("yt-action-result")) {
     if (ytBusy || !connected) return;
     const session = epoch;
-    const result = $("yt-action-result");
     ++ytVersion;
     ytBusy = true;
     showPlayer({state:ytState,title:$("yt-playing").textContent});
@@ -1375,7 +1653,8 @@ if (isFrame) {
       if (session !== epoch) return;
       ytBusy = false;
       showPlayer(data);
-      result.textContent = data.queued ? data.queued+"곡을 재생 대기열에 넣었습니다." : "";
+      result.textContent = data.queued ? data.queued+"곡을 재생 대기열에 넣었습니다."
+        : (result === shortcutResult ? "YouTube 재생을 요청했습니다." : "");
     } catch (error) {
       if (session !== epoch) return;
       ytBusy = false;
@@ -1397,6 +1676,9 @@ if (isFrame) {
       const data = await call("/api/ytmusic/library","GET",undefined,30000);
       if (session !== epoch || version !== libraryVersion) return;
       libraryConnected = data.connected;
+      shortcutPlaylists = data.connected
+        ? [{playlistId:"liked",title:"좋아요 표시한 음악"}, ...data.playlists] : [];
+      shortcutOptions();
       label.textContent = data.connected ? "계정 연동됨" : "계정 연동 필요";
       const items = data.playlists.map(playlist => {
         const button = document.createElement("button");
@@ -1527,6 +1809,18 @@ if (isFrame) {
     ytBusy = false;
     analogBusy = false;
     libraryConnected = false;
+    shortcutBusy = false;
+    shortcutPlaylists = [];
+    shortcutResult.textContent = "";
+    $("shortcut-url").value = "";
+    $("shortcut-name").value = "";
+    showShortcuts([]);
+    mpdOutput = null;
+    mpdOutputBusy = false;
+    $("mpd-output-toggle").disabled = true;
+    $("mpd-output-toggle").setAttribute("aria-pressed","false");
+    $("mpd-output-refresh").disabled = false;
+    $("mpd-output-state").textContent = "MPD 출력 확인 중";
     $("yt-playlists").replaceChildren();
     $("yt-query").value = "";
     $("yt-action-result").textContent = "";
@@ -1694,7 +1988,7 @@ if (isFrame) {
       message("");
       remoteMusic(data.music,data.music_error);
       await Promise.all([refreshSystem(),refreshMemos(),refreshQueue(),
-        refreshYouTubeLibrary(),refreshYouTube(),analogVolume()]);
+        refreshYouTubeLibrary(),refreshYouTube(),analogVolume(),updateShortcuts(),mpdOutputRequest()]);
     } catch (error) {
       if (session === epoch) showError(error);
     }

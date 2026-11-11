@@ -267,3 +267,61 @@ ALSA_PCM=analog_shared
 ```
 
 환경 파일을 수정한 뒤 웹 서비스를 재시작하세요. **3.5mm 아날로그(RCA) 볼륨**은 `Master`와 `Headphone` 각각에 같은 비율과 `unmute`를 적용합니다. **스피커 최적 볼륨 (85%)**은 85% 프리셋입니다. 연결한 앰프나 스피커의 볼륨과 함께 조절하세요. 한쪽 믹서만 있으면 화면에 적용된 믹서를 표시합니다. MPD의 재생 카드에 있는 볼륨은 기존 MPD 제어입니다. [amixer 매뉴얼](https://manpages.debian.org/trixie/alsa-utils/amixer.1.en.html)
+
+## 8. 내장 스피커와 광출력 전환
+
+`aplay -l`로 **같은 카드의 장치 0이 아날로그이고 장치 1이 S/PDIF**인지 먼저 확인하세요. `CARD`에는 목록에 표시된 ALSA 카드 식별자를 사용합니다. 아래 예시의 `NVidia`는 실제 장치에 맞춰 바꿉니다. [ALSA 장치 이름 규칙](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html)
+
+```bash
+aplay -l
+sudo cp -an /etc/mpd.conf /etc/mpd.conf.before-web-output
+sudoedit /etc/mpd.conf
+```
+
+전환하려는 기존 `type "alsa"` 출력의 `name`을 **MacBook switchable output**으로 지정하고, `device`를 아래 형식으로 바꾸세요. 이미 `DEV=0/1`로 지정한 ALSA 출력이 하나라면 이 이름 없이도 인식합니다. 설치 스크립트에서 쓴 `macbook_server_spdif` 또는 `spdif_shared`는 별칭이므로 전환 기능을 사용하려면 MPD 출력에서 직접 장치를 지정해야 합니다. 별칭의 ALSA 공유 설정이 필요한 환경에서는 `plughw` 직접 출력으로 변경한 뒤 다른 플레이어와의 동시 사용을 확인하세요. [MPD 출력 설정](https://mpd.readthedocs.io/en/stable/mpd.conf.5.html)
+
+```text
+audio_output {
+    type       "alsa"
+    name       "MacBook switchable output"
+    device     "plughw:CARD=NVidia,DEV=1"
+    mixer_type "software"
+}
+```
+
+기존 ALSA 블록의 다른 설정과 FIFO 출력 블록을 보존하세요. `DEV=0`은 내장 스피커, `DEV=1`은 광출력입니다. 위 예시는 광출력으로 시작합니다.
+
+내려받은 `mpd_output_switch.py`를 아래 위치에 설치합니다.
+
+```bash
+sudo install -o root -g root -m 0755 mpd_output_switch.py /usr/local/sbin/macbook-mpd-output
+sudo visudo -f /etc/sudoers.d/macbook-mpd-output
+```
+
+sudoers에는 다음 한 줄을 등록하세요. [Debian sudoers 매뉴얼](https://manpages.debian.org/bookworm/sudo/sudoers.5.en.html)
+
+```sudoers
+macbook-assistant ALL=(root) NOPASSWD: /usr/local/sbin/macbook-mpd-output status, /usr/local/sbin/macbook-mpd-output speaker, /usr/local/sbin/macbook-mpd-output optical
+```
+
+```bash
+sudo chmod 0440 /etc/sudoers.d/macbook-mpd-output
+sudo visudo -c
+sudo install -d -m 0755 /etc/systemd/system/macbook-web.service.d
+sudo tee /etc/systemd/system/macbook-web.service.d/mpd-output.conf >/dev/null <<'EOF'
+[Service]
+ReadWritePaths=/etc
+EOF
+sudo systemctl daemon-reload
+sudo -u macbook-assistant /usr/bin/sudo -n /usr/local/sbin/macbook-mpd-output status
+sudo systemctl restart mpd
+sudo systemctl restart macbook-web.service
+```
+
+`ReadWritePaths=/etc`는 웹 서비스가 실행한 전환 도구에서 설정 파일을 같은 디렉터리의 임시 파일로 교체할 수 있도록 합니다. 웹 서비스 계정에는 기존 파일 권한이 적용되며, root로 실행되는 도구는 위의 세 명령으로 제한됩니다.
+
+리모컨의 **내장 스피커 ↔ 광출력(DAC)** 버튼은 해당 ALSA 블록의 `DEV` 값만 바꾸고 `systemctl restart mpd`를 실행합니다. 재시작에 실패하면 도구가 변경 전 설정을 복구하고 MPD를 다시 시작합니다. 전환 중에는 재생이 잠시 끊깁니다. MPD의 `state_file` 설정은 재시작 뒤 대기열을 복원하는 데 사용됩니다. 이 버튼은 MPD에 적용되며, YouTube의 mpv 출력은 7절의 `ALSA_PCM`으로 지정합니다. [MPD 상태 파일 설정](https://mpd.readthedocs.io/en/stable/mpd.conf.5.html)
+
+## 9. YouTube 재생목록 바로가기
+
+리모컨 상단의 **YouTube 바로가기 → 바로가기 관리**에서 보관함의 재생목록을 선택하거나 이름과 재생목록 공유 주소를 입력해 최대 5개를 등록하세요. 등록된 버튼을 한 번 누르면 맥북에서 재생을 시작합니다. 보관함 바로가기는 계정 연동을 사용합니다. 공개 재생목록 공유 주소도 등록할 수 있습니다. 바로가기는 맥북에 저장되어 다른 휴대폰이나 브라우저에서도 같은 리모컨에 로그인하면 표시됩니다.
